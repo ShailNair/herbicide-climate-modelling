@@ -1,71 +1,56 @@
 # ============================================================================
-# herbicide discharge - erosivity relationship analysis
+# XGBoost machine learning framework with erosivity-application interactions
 # ============================================================================
-
-rm(list = ls())
-set.seed(123)
-
 library(tidyverse)
 library(data.table)
 library(sf)
 library(spdep)
 library(blockCV)
 library(xgboost)
+library(SHAPforxgboost)
 library(car)
-library(FNN)
 library(zoo)
+library(parallel)
 
 # --- Configuration ---
-analysis_config <- list(
+config <- list(
+  spatial_block_size_m = 200000,
   cv_folds = 5,
-  spatial_block_range_m = 200000,
-  random_seed = 123,
+  temporal_validation_years = 3,
+  monte_carlo_sims = 1000,
   vif_threshold = 5,
   min_years_per_location = 5,
   outlier_percentiles = c(0.01, 0.99),
-  moran_k_neighbors = 8
+  random_seed = 123,
+  rcp45_erosivity_uncertainty_sd = 0.20,
+  baseline_variability_factor = 0.15,
+  apr_uncertainty_sd = 0.15,
+  rnf_uncertainty_sd = 0.15
 )
 
-set.seed(analysis_config$random_seed)
+set.seed(config$random_seed)
 
 # ============================================================================
-# Data loading and processing
+# Data loading and quality Control
 # ============================================================================
 
-discharge_raw <- read_csv("DIS_annual.csv", show_col_types = FALSE)
+discharge_raw <- read_csv("DIS_annual.csv", 
+                         show_col_types = FALSE)
 
 discharge <- discharge_raw %>%
-  mutate(
-    quality_flag = case_when(
-      sum_discharge <= 0 | is.na(sum_discharge) ~ "invalid",
-      sum_discharge < quantile(sum_discharge, analysis_config$outlier_percentiles[1], na.rm = TRUE) ~ "low_outlier",
-      sum_discharge > quantile(sum_discharge, analysis_config$outlier_percentiles[2], na.rm = TRUE) ~ "high_outlier",
-      TRUE ~ "valid"
-    )
-  ) %>%
-  filter(quality_flag == "valid") %>%
-  mutate(
-    raw_discharge = sum_discharge,
-    log_discharge = log10(sum_discharge),
-    sqrt_discharge = sqrt(sum_discharge),
-    boxcox_discharge = (sum_discharge^0.5 - 1) / 0.5
-  ) %>%
-  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
-
-log_discharge <- discharge_raw %>%
-  mutate(
-    log_sum_discharge = if_else(sum_discharge == 0 | is.na(sum_discharge), 
-                                log10(0.001), log10(sum_discharge)),
-    log_mean_discharge = if_else(mean_discharge == 0 | is.na(mean_discharge), 
-                                 log10(0.001), log10(mean_discharge))
-  ) %>%
   filter(
-    log_sum_discharge > quantile(log_sum_discharge, 0.01, na.rm = TRUE),
-    log_sum_discharge < quantile(log_sum_discharge, 0.99, na.rm = TRUE)
+    !is.na(sum_discharge),
+    sum_discharge > 0,
+    sum_discharge >= quantile(sum_discharge, config$outlier_percentiles[1], na.rm = TRUE),
+    sum_discharge <= quantile(sum_discharge, config$outlier_percentiles[2], na.rm = TRUE)
+  ) %>%
+  mutate(
+    log_discharge = log10(sum_discharge),
+    location_id = paste(round(lon, 2), round(lat, 2), sep = "_")
   ) %>%
   st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
 
-# Load covariates
+# --- Load covariates ---
 apr <- fread("annual_apr.csv") %>%
   rename(apr = apr) %>%
   filter(year %in% unique(discharge$year)) %>%
@@ -76,7 +61,7 @@ rnf <- fread("annual_rnf.csv") %>%
   filter(year %in% unique(discharge$year)) %>%
   st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
 
-ERA5Land <- fread("ERA5Land_2001_2021_erosivity.csv") %>%
+erosivity <- fread("ERA5Land_2001_2021_erosivity.csv") %>%
   rename(erosivity = data) %>%
   filter(year %in% unique(discharge$year)) %>%
   st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
@@ -86,48 +71,42 @@ rcp45_change <- fread("2010-2050-rcp4.5_final.csv") %>%
   st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
 
 # ============================================================================
-# Spatial aggregation (50 Km buffer)
+# Spatial Aggregation (50 km Buffer)
 # ============================================================================
 
-join_and_aggregate_covariates_safe <- function(discharge_sf, covariate_sf, covariate_name, buffer_size_m) {
+join_aggregate_covariate <- function(discharge_sf, covariate_sf, 
+                                    covariate_name, buffer_m = 50000) {
   discharge_proj <- st_transform(discharge_sf, crs = 3857)
-  buffers <- st_buffer(discharge_proj, dist = buffer_size_m)
+  buffers <- st_buffer(discharge_proj, dist = buffer_m)
   covariate_proj <- st_transform(covariate_sf, crs = 3857)
-  joined_data <- st_join(buffers, covariate_proj, join = st_intersects)
   
-  aggregated_data <- joined_data %>%
+  joined <- st_join(buffers, covariate_proj, join = st_intersects)
+  
+  aggregated <- joined %>%
     st_drop_geometry() %>%
-    group_by(lon.x, lat.x, year.x) %>%
+    group_by(lon.x, lat.x, year.x, location_id) %>%
     summarise(
-      !!paste0(covariate_name, "_mean") := ifelse(all(is.na(!!sym(covariate_name))), NA_real_, 
-                                                   mean(!!sym(covariate_name), na.rm = TRUE)),
-      !!paste0(covariate_name, "_median") := ifelse(all(is.na(!!sym(covariate_name))), NA_real_,
-                                                    median(!!sym(covariate_name), na.rm = TRUE)),
-      !!paste0(covariate_name, "_sd") := ifelse(all(is.na(!!sym(covariate_name))), NA_real_,
-                                                sd(!!sym(covariate_name), na.rm = TRUE)),
+      !!paste0(covariate_name, "_mean") := mean(!!sym(covariate_name), na.rm = TRUE),
+      !!paste0(covariate_name, "_sd") := sd(!!sym(covariate_name), na.rm = TRUE),
       !!paste0(covariate_name, "_count") := sum(!is.na(!!sym(covariate_name))),
       .groups = "drop"
     ) %>%
     rename(lon = lon.x, lat = lat.x, year = year.x) %>%
     filter(!is.na(!!sym(paste0(covariate_name, "_mean"))))
   
-  return(aggregated_data)
+  return(aggregated)
 }
 
-BUFFER_M <- 50000
-
-apr_buffered <- join_and_aggregate_covariates_safe(discharge, apr, "apr", BUFFER_M)
-rnf_buffered <- join_and_aggregate_covariates_safe(discharge, rnf, "rnf", BUFFER_M)
-erosivity_buffered <- join_and_aggregate_covariates_safe(discharge, ERA5Land, "erosivity", BUFFER_M)
+apr_agg <- join_aggregate_covariate(discharge, apr, "apr")
+rnf_agg <- join_aggregate_covariate(discharge, rnf, "rnf")
+erosivity_agg <- join_aggregate_covariate(discharge, erosivity, "erosivity")
 
 data_merged <- discharge %>%
-  left_join(apr_buffered, by = c("lon", "lat", "year")) %>%
-  left_join(rnf_buffered, by = c("lon", "lat", "year")) %>%
-  left_join(erosivity_buffered, by = c("lon", "lat", "year"))
-
-data_50km_clean <- data_merged %>%
+  left_join(apr_agg, by = c("lon", "lat", "year", "location_id")) %>%
+  left_join(rnf_agg, by = c("lon", "lat", "year", "location_id")) %>%
+  left_join(erosivity_agg, by = c("lon", "lat", "year", "location_id")) %>%
   filter(
-    !is.na(log_sum_discharge),
+    !is.na(log_discharge),
     !is.na(apr_mean),
     !is.na(rnf_mean),
     !is.na(erosivity_mean)
@@ -135,30 +114,20 @@ data_50km_clean <- data_merged %>%
 
 # ============================================================================
 # Feature engineering
-# Interactions, lagged variables (1-year), and transformations
 # ============================================================================
 
-data_engineered <- data_50km_clean %>%
-  arrange(lon, lat, year) %>%
-  group_by(lon, lat) %>%
+data_features <- data_merged %>%
+  arrange(location_id, year) %>%
+  group_by(location_id) %>%
   mutate(
-    erosivity_apr_interaction = erosivity_mean * apr_mean,
-    erosivity_rnf_interaction = erosivity_mean * rnf_mean,
-    apr_rnf_interaction = apr_mean * rnf_mean,
-    
     apr_lag1 = lag(apr_mean, 1),
     erosivity_lag1 = lag(erosivity_mean, 1),
-    discharge_lag1 = lag(log_sum_discharge, 1),
     
     apr_ma3 = zoo::rollmean(apr_mean, k = 3, fill = NA, align = "right"),
     erosivity_ma3 = zoo::rollmean(erosivity_mean, k = 3, fill = NA, align = "right"),
-    rnf_ma3 = zoo::rollmean(rnf_mean, k = 3, fill = NA, align = "right"),
     
-    cumulative_erosivity = cumsum(erosivity_mean),
-    cumulative_apr = cumsum(apr_mean),
-    
-    erosivity_to_apr_ratio = erosivity_mean / (apr_mean + 0.001),
-    normalized_rnf = rnf_mean / (apr_mean + 0.001),
+    erosivity_apr_interaction = erosivity_mean * apr_mean,
+    erosivity_rnf_interaction = erosivity_mean * rnf_mean,
     
     log_apr = log10(apr_mean + 0.001),
     log_erosivity = log10(erosivity_mean + 0.001),
@@ -167,12 +136,13 @@ data_engineered <- data_50km_clean %>%
     erosivity_squared = erosivity_mean^2,
     apr_squared = apr_mean^2,
     
-    year_scaled = scale(year)[,1]
+    erosivity_to_apr_ratio = erosivity_mean / (apr_mean + 0.001),
+    
+    year_scaled = scale(year)[,1],
+    
+    n_years = n()
   ) %>%
-  ungroup()
-
-# Regional stratification
-data_engineered <- data_engineered %>%
+  ungroup() %>%
   mutate(
     climate_zone = case_when(
       abs(lat) > 60 ~ "Polar",
@@ -180,114 +150,73 @@ data_engineered <- data_engineered %>%
       abs(lat) > 23.5 ~ "Subtropical",
       TRUE ~ "Tropical"
     ),
-    hemisphere = if_else(lat >= 0, "Northern", "Southern"),
-    coastal_region = case_when(
-      lon < -100 & lat > 30 ~ "North America West",
-      lon > -100 & lon < -50 & lat > 30 ~ "North America East",
-      lon > -20 & lon < 40 & lat > 35 ~ "Europe",
-      lon > 100 & lat > 20 ~ "East Asia",
-      lon > 100 & lat < 20 & lat > -10 ~ "Southeast Asia",
-      TRUE ~ "Other"
-    )
+    region = if_else(abs(lat) > 23.5, "Temperate", "Tropical")
   )
 
-# Quality filtering and minimum temporal coverage
-data_clean <- data_engineered %>%
+data_clean <- data_features %>%
   filter(
-    !is.na(log_sum_discharge),
-    !is.na(apr_mean),
-    !is.na(rnf_mean),
-    !is.na(erosivity_mean),
+    n_years >= config$min_years_per_location,
+    !is.na(apr_lag1),
     is.finite(log_apr),
     is.finite(log_erosivity),
     is.finite(log_rnf)
   ) %>%
-  group_by(lon, lat) %>%
-  filter(row_number() > 1) %>%
-  ungroup() %>%
-  group_by(lon, lat) %>%
-  mutate(n_years = n()) %>%
-  filter(n_years >= 5) %>%
-  ungroup() %>%
   dplyr::select(-n_years)
+
+# ============================================================================
+# Spatiotemporal cross-validation (200 km spatial blocks, 5-fold)
+# ============================================================================
+
+years_all <- sort(unique(data_clean$year))
+years_train <- years_all[1:(length(years_all) - config$temporal_validation_years)]
+years_temporal_test <- years_all[(length(years_all) - config$temporal_validation_years + 1):length(years_all)]
+
+data_train <- data_clean %>% filter(year %in% years_train)
+data_temporal_test <- data_clean %>% filter(year %in% years_temporal_test)
+
+data_train_sf <- st_as_sf(data_train, coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(crs = 3857)
+
+spatial_blocks <- spatialBlock(
+  speciesData = data_train_sf,
+  species = "log_discharge",
+  theRange = config$spatial_block_size_m,
+  k = config$cv_folds,
+  selection = "random",
+  iteration = 100,
+  biomod2Format = FALSE,
+  verbose = FALSE
+)
 
 # ============================================================================
 # Feature selection - VIF < 5
 # ============================================================================
 
-model_data <- data_clean %>%
-  st_drop_geometry() %>%
-  filter(complete.cases(.))
-
-# Feature set: erosivity, application rates, runoff, interactions, and 1-year lags
-selected_features <- c(
+candidate_features <- c(
   "erosivity_mean", "apr_mean", "rnf_mean",
   "erosivity_apr_interaction", "erosivity_rnf_interaction",
-  "log_erosivity", "log_apr", "log_rnf",
   "apr_lag1", "erosivity_lag1",
-  "erosivity_ma3", "apr_ma3"
+  "erosivity_ma3", "apr_ma3",
+  "log_erosivity", "log_apr", "log_rnf",
+  "erosivity_squared", "apr_squared",
+  "year_scaled"
 )
 
-# VIF assessment for multicollinearity (threshold < 5)
-feature_data <- model_data[, selected_features]
-vif_values <- car::vif(lm(log_sum_discharge ~ ., data = cbind(log_sum_discharge = model_data$log_sum_discharge, feature_data)))
+# VIF-based feature selection
+X_vif <- data_train %>%
+  st_drop_geometry() %>%
+  dplyr::select(all_of(candidate_features)) %>%
+  as.data.frame()
 
-selected_features <- names(vif_values[vif_values < analysis_config$vif_threshold])
+vif_values <- car::vif(lm(log_discharge ~ ., 
+                         data = cbind(log_discharge = data_train$log_discharge, X_vif)))
 
-# ============================================================================
-# Spatial cross-validation (200 Km blocks, 5-fold)
-# ============================================================================
-
-model_data_sf <- st_as_sf(model_data, coords = c("lon", "lat"), crs = 4326)
-model_data_sf_proj <- st_transform(model_data_sf, crs = 3857)
-
-spatial_folds <- spatialBlock(
-  speciesData = model_data_sf_proj,
-  species = "log_sum_discharge",
-  k = analysis_config$cv_folds,
-  selection = "random",
-  iteration = 100,
-  biomod2Format = FALSE,
-  xOffset = 0,
-  yOffset = 0,
-  r = NULL
-)
-
-# Model performance evaluation function
-evaluate_model <- function(observed, predicted, model_name) {
-  valid_idx <- !is.na(predicted) & !is.na(observed)
-  obs <- observed[valid_idx]
-  pred <- predicted[valid_idx]
-  
-  if (length(obs) < 2) {
-    return(list(
-      Model = model_name, R2 = NA, RMSE = NA, MAE = NA, 
-      MAPE = NA, Bias = NA, n = length(obs)
-    ))
-  }
-  
-  ss_res <- sum((obs - pred)^2)
-  ss_tot <- sum((obs - mean(obs))^2)
-  r2 <- 1 - (ss_res / ss_tot)
-  rmse <- sqrt(mean((obs - pred)^2))
-  mae <- mean(abs(obs - pred))
-  mape <- mean(abs((obs - pred) / obs)) * 100
-  bias <- mean(pred - obs)
-  
-  return(list(
-    Model = model_name,
-    R2 = r2,
-    RMSE = rmse,
-    MAE = mae,
-    MAPE = mape,
-    Bias = bias,
-    n = length(obs)
-  ))
-}
+final_features <- names(vif_values[vif_values < config$vif_threshold])
 
 # ============================================================================
-# Xgboost model
+# XGBoost hyperparameter tuning with L1/L2 regularization
 # ============================================================================
+
 param_grid <- expand.grid(
   max_depth = c(4, 6, 8),
   eta = c(0.01, 0.05, 0.1),
@@ -297,456 +226,476 @@ param_grid <- expand.grid(
   gamma = c(0, 0.1, 0.2)
 )
 
-param_sample <- param_grid[sample(nrow(param_grid), min(20, nrow(param_grid))), ]
-
-evaluate_xgb_params <- function(params, folds, data, features, target_col) {
+evaluate_xgb_params <- function(params, folds, data, features, target) {
   cv_scores <- numeric(length(folds))
   
-  for (i in 1:length(folds)) {
-    fold_indices <- folds[[i]]
-    train_idx <- fold_indices[[1]]
-    test_idx <- fold_indices[[2]]
-    
-    train_data <- data[train_idx, ]
-    test_data <- data[test_idx, ]
+  for (i in seq_along(folds)) {
+    train_idx <- folds[[i]][[1]]
+    test_idx <- folds[[i]][[2]]
     
     dtrain <- xgb.DMatrix(
-      data = as.matrix(train_data[, features]),
-      label = train_data[[target_col]]
+      data = as.matrix(data[train_idx, features, drop = FALSE]),
+      label = data[[target]][train_idx]
     )
-    
     dtest <- xgb.DMatrix(
-      data = as.matrix(test_data[, features]),
-      label = test_data[[target_col]]
+      data = as.matrix(data[test_idx, features, drop = FALSE]),
+      label = data[[target]][test_idx]
     )
     
-    # XGBoost with L1 (alpha) and L2 (lambda) regularization
-    xgb_model <- xgb.train(
-      params = list(
+    model <- xgb.train(
+      params = c(
         objective = "reg:squarederror",
-        max_depth = params$max_depth,
-        eta = params$eta,
-        subsample = params$subsample,
-        colsample_bytree = params$colsample_bytree,
-        min_child_weight = params$min_child_weight,
-        gamma = params$gamma,
+        as.list(params),
         lambda = 1,
-        alpha = 0.1
+        alpha = 0.1,
+        eval_metric = "rmse"
       ),
       data = dtrain,
-      nrounds = 500,
-      early_stopping_rounds = 50,
-      watchlist = list(test = dtest),
+      nrounds = 50,
+      early_stopping_rounds = 10,
+      watchlist = list(val = dtest),
       verbose = 0
     )
     
-    preds <- predict(xgb_model, dtest)
-    cv_scores[i] <- sqrt(mean((test_data[[target_col]] - preds)^2))
+    preds <- predict(model, dtest)
+    cv_scores[i] <- sqrt(mean((data[[target]][test_idx] - preds)^2))
   }
   
   return(mean(cv_scores))
 }
 
-best_rmse <- Inf
-best_params <- NULL
+# Parallel hyperparameter search
+n_cores <- min(detectCores() - 1, 12)
+data_train_df <- data_train %>% st_drop_geometry()
 
-for (i in 1:nrow(param_sample)) {
-  params <- param_sample[i, ]
-  
+cl <- makeCluster(n_cores)
+clusterExport(cl, c("evaluate_xgb_params", "spatial_blocks", "data_train_df", 
+                   "final_features", "param_grid"))
+clusterEvalQ(cl, {
+  library(xgboost)
+  library(dplyr)
+})
+
+param_results <- parLapply(cl, 1:nrow(param_grid), function(i) {
+  params <- as.list(param_grid[i, ])
   rmse <- evaluate_xgb_params(
     params = params,
-    folds = spatial_folds$folds,
-    data = model_data,
-    features = selected_features,
-    target_col = "log_sum_discharge"
+    folds = spatial_blocks$folds,
+    data = data_train_df,
+    features = final_features,
+    target = "log_discharge"
   )
-  
-  if (rmse < best_rmse) {
-    best_rmse <- rmse
-    best_params <- params
-  }
-}
+  return(list(params = params, rmse = rmse))
+})
 
-xgb_train_preds_full <- rep(NA, nrow(model_data))
-xgb_test_preds_full <- rep(NA, nrow(model_data))
+stopCluster(cl)
+
+rmse_values <- sapply(param_results, function(x) x$rmse)
+best_idx <- which.min(rmse_values)
+best_params <- param_results[[best_idx]]$params
+
+# ============================================================================
+# Train XGBoost models on each spatial fold
+# ============================================================================
+
+data_train_clean <- data_train %>%
+  st_drop_geometry() %>%
+  dplyr::select(all_of(c("log_discharge", final_features))) %>%
+  as.data.frame()
+
 xgb_models <- list()
+xgb_predictions_train <- numeric(nrow(data_train_clean))
+xgb_predictions_test <- numeric(nrow(data_train_clean))
 
-for (i in 1:length(spatial_folds$folds)) {
-  fold_indices <- spatial_folds$folds[[i]]
-  train_idx <- fold_indices[[1]]
-  test_idx <- fold_indices[[2]]
-  
-  train_data <- model_data[train_idx, ]
-  test_data <- model_data[test_idx, ]
+for(i in 1:length(spatial_blocks$folds)) {
+  train_idx <- spatial_blocks$folds[[i]][[1]]
+  test_idx <- spatial_blocks$folds[[i]][[2]]
   
   dtrain <- xgb.DMatrix(
-    data = as.matrix(train_data[, selected_features]),
-    label = train_data$log_sum_discharge
+    data = as.matrix(data_train_clean[train_idx, final_features, drop = FALSE]),
+    label = data_train_clean$log_discharge[train_idx]
   )
-  
   dtest <- xgb.DMatrix(
-    data = as.matrix(test_data[, selected_features]),
-    label = test_data$log_sum_discharge
+    data = as.matrix(data_train_clean[test_idx, final_features, drop = FALSE]),
+    label = data_train_clean$log_discharge[test_idx]
   )
   
-  xgb_fold <- xgb.train(
-    params = list(
+  model <- xgb.train(
+    params = c(
       objective = "reg:squarederror",
-      max_depth = best_params$max_depth,
-      eta = best_params$eta,
-      subsample = best_params$subsample,
-      colsample_bytree = best_params$colsample_bytree,
-      min_child_weight = best_params$min_child_weight,
-      gamma = best_params$gamma,
+      as.list(best_params),
       lambda = 1,
       alpha = 0.1,
       eval_metric = "rmse"
     ),
     data = dtrain,
-    nrounds = 1000,
-    early_stopping_rounds = 50,
+    nrounds = 200,
+    early_stopping_rounds = 20,
     watchlist = list(train = dtrain, test = dtest),
     verbose = 0
   )
   
-  xgb_models[[i]] <- xgb_fold
-  xgb_train_preds_full[train_idx] <- predict(xgb_fold, dtrain)
-  xgb_test_preds_full[test_idx] <- predict(xgb_fold, dtest)
+  xgb_models[[i]] <- model
+  xgb_predictions_train[train_idx] <- predict(model, dtrain)
+  xgb_predictions_test[test_idx] <- predict(model, dtest)
 }
 
-# Evaluate model performance
-xgb_train_metrics <- evaluate_model(
-  model_data$log_sum_discharge, 
-  xgb_train_preds_full, 
-  "XGBoost_Full"
-)
-
-xgb_test_metrics <- evaluate_model(
-  model_data$log_sum_discharge, 
-  xgb_test_preds_full, 
-  "XGBoost_Full"
-)
-
-# ============================================================================
-# Feature importance (Gain-based)
-# ============================================================================
-
-importance_list <- lapply(xgb_models, function(model) {
-  imp <- xgb.importance(model = model)
-  return(imp)
-})
-
-all_features <- unique(unlist(lapply(importance_list, function(x) x$Feature)))
-avg_importance <- sapply(all_features, function(feat) {
-  gains <- sapply(importance_list, function(imp) {
-    idx <- which(imp$Feature == feat)
-    if (length(idx) > 0) imp$Gain[idx] else 0
-  })
-  mean(gains)
-})
-
-importance_df <- data.frame(
-  Feature = all_features,
-  Importance = avg_importance
-) %>%
-  arrange(desc(Importance)) %>%
-  mutate(
-    Cumulative_Importance = cumsum(Importance) / sum(Importance),
-    Feature_Clean = case_when(
-      Feature == "erosivity_mean" ~ "Erosivity",
-      Feature == "apr_mean" ~ "Application Rate",
-      Feature == "rnf_mean" ~ "Runoff",
-      Feature == "erosivity_apr_interaction" ~ "Erosivity × Application",
-      Feature == "erosivity_rnf_interaction" ~ "Erosivity × Runoff",
-      Feature == "log_erosivity" ~ "Log(Erosivity)",
-      Feature == "log_apr" ~ "Log(Application)",
-      Feature == "log_rnf" ~ "Log(Runoff)",
-      TRUE ~ Feature
-    )
-  )
-
-# ============================================================================
-# Spatial autocorrelation assessment
-# Moran's I with k-nearest neighbors (k=8)
-# ============================================================================
-
-xgb_residuals <- model_data$log_sum_discharge - xgb_test_preds_full
-
-valid_idx <- !is.na(xgb_residuals)
-xgb_residuals_clean <- xgb_residuals[valid_idx]
-coords_clean <- model_data[valid_idx, c("lon", "lat")]
-
-coords_check <- coords_clean %>%
-  group_by(lon, lat) %>%
-  summarise(n = n(), .groups = "drop")
-
-if (any(coords_check$n > 1)) {
-  residual_by_location <- data.frame(
-    lon = coords_clean$lon,
-    lat = coords_clean$lat,
-    residuals = xgb_residuals_clean
-  ) %>%
-    group_by(lon, lat) %>%
-    summarise(residuals = mean(residuals, na.rm = TRUE), .groups = "drop")
+# --- Performance metrics ---
+calculate_metrics <- function(actual, predicted) {
+  valid_idx <- !is.na(actual) & !is.na(predicted)
+  actual <- actual[valid_idx]
+  predicted <- predicted[valid_idx]
   
-  coords_clean <- residual_by_location[, c("lon", "lat")]
-  xgb_residuals_clean <- residual_by_location$residuals
+  list(
+    R2 = cor(actual, predicted)^2,
+    RMSE = sqrt(mean((actual - predicted)^2)),
+    MAE = mean(abs(actual - predicted)),
+    Bias = mean(predicted - actual)
+  )
 }
 
-coords_sf <- st_as_sf(coords_clean, coords = c("lon", "lat"), crs = 4326)
-coords_proj <- st_transform(coords_sf, crs = 3857)
-coords_mat <- st_coordinates(coords_proj)
+metrics_train_cv <- calculate_metrics(data_train_clean$log_discharge, xgb_predictions_train)
+metrics_test_cv <- calculate_metrics(data_train_clean$log_discharge, xgb_predictions_test)
 
-if (any(duplicated(coords_mat))) {
-  dup_idx <- !duplicated(coords_mat)
-  coords_mat <- coords_mat[dup_idx, ]
-  xgb_residuals_clean <- xgb_residuals_clean[dup_idx]
-}
-
-# Use k-nearest neighbors (k=8) as per methods
-knn <- knn2nb(knearneigh(coords_mat, k = analysis_config$moran_k_neighbors))
-listw <- nb2listw(knn, style = "W", zero.policy = TRUE)
-
-moran_xgb <- tryCatch({
-  moran.test(xgb_residuals_clean, listw, zero.policy = TRUE, alternative = "two.sided")
-}, error = function(e) {
-  tryCatch({
-    spatial_lag <- lag.listw(listw, xgb_residuals_clean, zero.policy = TRUE)
-    simple_cor <- cor(xgb_residuals_clean, spatial_lag, use = "complete.obs")
-    list(
-      statistic = simple_cor,
-      p.value = NA,
-      method = "Simple spatial correlation (Moran's I approximation)"
-    )
-  }, error = function(e2) {
-    list(statistic = NA, p.value = NA, method = "Failed")
-  })
-})
-
-if ("statistic" %in% names(moran_xgb)) {
-  morans_i_value <- as.numeric(moran_xgb$statistic)
-} else if ("observed" %in% names(moran_xgb)) {
-  morans_i_value <- as.numeric(moran_xgb$observed)
-} else {
-  morans_i_value <- NA
-}
+cv_performance <- data.frame(
+  Dataset = c("Train", "Test"),
+  R2 = c(metrics_train_cv$R2, metrics_test_cv$R2),
+  RMSE = c(metrics_train_cv$RMSE, metrics_test_cv$RMSE),
+  MAE = c(metrics_train_cv$MAE, metrics_test_cv$MAE),
+  Bias = c(metrics_train_cv$Bias, metrics_test_cv$Bias),
+  Overfitting_Ratio = c(NA, metrics_test_cv$R2 / metrics_train_cv$R2)
+)
 
 # ============================================================================
-# Final model training
+# Train final model on all training Data
 # ============================================================================
+
+final_nrounds <- round(median(sapply(xgb_models, function(m) m$best_iteration)))
 
 dtrain_full <- xgb.DMatrix(
-  data = as.matrix(model_data[, selected_features]),
-  label = model_data$log_sum_discharge
+  data  = as.matrix(data_train_clean[, final_features, drop = FALSE]),
+  label = data_train_clean$log_discharge
 )
 
 xgb_final <- xgb.train(
-  params = list(
+  params = c(
     objective = "reg:squarederror",
-    max_depth = best_params$max_depth,
-    eta = best_params$eta,
-    subsample = best_params$subsample,
-    colsample_bytree = best_params$colsample_bytree,
-    min_child_weight = best_params$min_child_weight,
-    gamma = best_params$gamma,
+    as.list(best_params),
     lambda = 1,
-    alpha = 0.1,
+    alpha  = 0.1,
     eval_metric = "rmse"
   ),
-  data = dtrain_full,
-  nrounds = 1000,
-  early_stopping_rounds = 50,
-  watchlist = list(train = dtrain_full),
+  data    = dtrain_full,
+  nrounds = final_nrounds,
   verbose = 0
 )
 
-xgb_package <- list(
-  model = xgb_final,
-  features = selected_features,
-  best_params = best_params,
-  train_metrics = xgb_train_metrics,
-  test_metrics = xgb_test_metrics,
-  importance = importance_df
+# ============================================================================
+# Temporal validation
+# ============================================================================
+
+dtest_temporal <- xgb.DMatrix(
+  data = as.matrix(data_temporal_test %>% st_drop_geometry() %>% 
+                  dplyr::select(all_of(final_features)))
+)
+
+preds_temporal <- predict(xgb_final, dtest_temporal)
+metrics_temporal <- calculate_metrics(data_temporal_test$log_discharge, preds_temporal)
+
+temporal_performance <- data.frame(
+  R2 = metrics_temporal$R2,
+  RMSE = metrics_temporal$RMSE,
+  MAE = metrics_temporal$MAE,
+  Bias = metrics_temporal$Bias
 )
 
 # ============================================================================
-# Future projections(2050)
+# Spatial autocorrelation assessment (Moran's I, k=8)
 # ============================================================================
 
-baseline_summary <- model_data %>%
-  group_by(lon, lat) %>%
+residuals_cv <- data_train_clean$log_discharge - xgb_predictions_test
+
+residual_spatial <- data_train %>%
+  st_drop_geometry() %>%
+  mutate(residual = residuals_cv) %>%
+  group_by(location_id, lon, lat) %>%
   summarise(
-    baseline_discharge = mean(log_sum_discharge, na.rm = TRUE),
-    baseline_erosivity = mean(erosivity_mean, na.rm = TRUE),
-    apr_mean = mean(apr_mean, na.rm = TRUE),
-    rnf_mean = mean(rnf_mean, na.rm = TRUE),
-    apr_lag1 = mean(apr_lag1, na.rm = TRUE),
-    erosivity_lag1 = mean(erosivity_lag1, na.rm = TRUE),
-    erosivity_ma3 = mean(erosivity_ma3, na.rm = TRUE),
-    apr_ma3 = mean(apr_ma3, na.rm = TRUE),
+    mean_residual = mean(residual, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(mean_residual))
+
+coords <- as.matrix(data.frame(
+  lon = as.numeric(residual_spatial$lon),
+  lat = as.numeric(residual_spatial$lat)
+))
+
+valid_coords <- complete.cases(coords)
+coords <- coords[valid_coords, ]
+mean_residuals <- residual_spatial$mean_residual[valid_coords]
+
+knn <- knearneigh(coords, k = 8)
+nb <- knn2nb(knn)
+listw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+moran_result <- tryCatch({
+  moran.mc(mean_residuals, listw, nsim = 999, zero.policy = TRUE)
+}, error = function(e) {
+  spatial_lag <- lag.listw(listw, mean_residuals, zero.policy = TRUE)
+  list(
+    statistic = cor(mean_residuals, spatial_lag, use = "complete.obs"),
+    p.value = NA
+  )
+})
+
+spatial_autocorr_results <- data.frame(
+  Metric = "Moran's I",
+  Value = moran_result$statistic,
+  P_Value = if(!is.na(moran_result$p.value)) moran_result$p.value else NA,
+  N_Locations = nrow(coords)
+)
+
+# ============================================================================
+# Feature importance (SHAP Values)
+# ============================================================================
+
+gain_list <- lapply(xgb_models, function(m) {
+  imp <- xgb.importance(model = m)
+  imp$Gain
+})
+
+gain_df <- data.frame(
+  Feature = xgb.importance(model = xgb_models[[1]])$Feature,
+  Gain_Mean = rowMeans(do.call(cbind, gain_list)),
+  Gain_SD   = apply(do.call(cbind, gain_list), 1, sd)
+)
+
+X_shap <- as.matrix(data_train_clean[, final_features, drop = FALSE])
+
+shap_vals <- shap.values(
+  xgb_model = xgb_final,
+  X_train   = X_shap
+)
+
+shap_long <- shap.prep(
+  shap_contrib = shap_vals$shap_score,
+  X_train      = X_shap
+)
+
+shap_df <- shap_long %>%
+  group_by(variable) %>%
+  summarise(
+    SHAP_MeanAbs = mean(abs(value)),
+    SHAP_Mean    = mean(value),
+    SHAP_PosFrac = mean(value > 0),
     .groups = "drop"
   )
 
-rcp45_summary <- rcp45_change %>%
-  st_drop_geometry() %>%
-  rename(erosivity_change_2050_raw = erosivity_change_2050)
+importance_final <- gain_df %>%
+  left_join(shap_df, by = c("Feature" = "variable")) %>%
+  arrange(desc(SHAP_MeanAbs))
 
-baseline_sf <- st_as_sf(baseline_summary, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
-rcp45_sf <- st_as_sf(rcp45_summary, coords = c("lon", "lat"), crs = 4326)
+# ============================================================================
+# 2050 Projections (RCP4.5)
+# ============================================================================
 
-baseline_proj <- st_transform(baseline_sf, crs = 3857)
-rcp45_proj <- st_transform(rcp45_sf, crs = 3857)
+baseline_years <- years_all[years_all >= 2001]
 
-buffers <- st_buffer(baseline_proj, dist = 50000)
-
-joined <- st_join(buffers, rcp45_proj, join = st_intersects)
-
-erosivity_2050_aggregated <- joined %>%
-  st_drop_geometry() %>%
-  group_by(lon, lat) %>%
+baseline_data <- data_clean %>%
+  filter(year %in% baseline_years) %>%
+  group_by(location_id, lon, lat) %>%
   summarise(
-    erosivity_change_2050 = mean(erosivity_change_2050_raw, na.rm = TRUE),
+    baseline_apr        = mean(apr_mean, na.rm = TRUE),
+    baseline_rnf        = mean(rnf_mean, na.rm = TRUE),
+    baseline_erosivity  = mean(erosivity_mean, na.rm = TRUE),
+    baseline_apr_lag1   = mean(apr_lag1, na.rm = TRUE),
+    baseline_erosivity_lag1 = mean(erosivity_lag1, na.rm = TRUE),
+    region        = first(region),
+    climate_zone  = first(climate_zone),
     .groups = "drop"
   )
 
-prediction_2050 <- baseline_summary %>%
-  left_join(erosivity_2050_aggregated, by = c("lon", "lat")) %>%
-  filter(!is.na(erosivity_change_2050))
+coastal_sf <- baseline_data %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
 
-prediction_2050 <- prediction_2050 %>%
+nearest_idx <- st_nearest_feature(
+  st_transform(coastal_sf, 3857),
+  st_transform(rcp45_change, 3857)
+)
+
+rcp45_matched <- rcp45_change[nearest_idx, ] %>%
+  st_drop_geometry()
+
+prediction_2050 <- baseline_data %>%
   mutate(
-    erosivity_2050 = baseline_erosivity * (1 + erosivity_change_2050 / 100),
-    erosivity_change_pct = erosivity_change_2050,
-    
-    erosivity_mean = erosivity_2050,
-    erosivity_apr_interaction = erosivity_2050 * apr_mean,
-    erosivity_rnf_interaction = erosivity_2050 * rnf_mean,
-    apr_rnf_interaction = apr_mean * rnf_mean,
-    
-    erosivity_to_apr_ratio = erosivity_2050 / (apr_mean + 0.001),
-    normalized_rnf = rnf_mean / (apr_mean + 0.001),
-    
+    erosivity_mean = pmax(baseline_erosivity + rcp45_matched$erosivity_change_2050, 0.1),
+    apr_mean = baseline_apr,
+    rnf_mean = baseline_rnf,
+    apr_lag1 = baseline_apr_lag1,
+    erosivity_lag1 = baseline_erosivity_lag1,
     log_apr = log10(apr_mean + 0.001),
-    log_erosivity = log10(erosivity_2050 + 0.001),
+    log_erosivity = log10(erosivity_mean + 0.001),
     log_rnf = log10(rnf_mean + 0.001),
-    
-    erosivity_squared = erosivity_2050^2,
-    apr_squared = apr_mean^2
+    erosivity_apr_interaction = erosivity_mean * apr_mean,
+    year_scaled = 0
   )
 
-dpredict_2050 <- xgb.DMatrix(data = as.matrix(prediction_2050[, selected_features]))
+pred_check <- prediction_2050 %>%
+  st_drop_geometry() %>%
+  as.data.frame()
 
-prediction_2050$predicted_discharge_2050 <- predict(xgb_package$model, dpredict_2050)
+dpredict_2050 <- xgb.DMatrix(
+  data = as.matrix(pred_check[, final_features, drop = FALSE])
+)
+
+prediction_2050$predicted_log_discharge_2050 <-
+  predict(xgb_final, dpredict_2050)
+
+baseline_pred_data <- baseline_data %>%
+  mutate(
+    apr_mean = baseline_apr,
+    rnf_mean = baseline_rnf,
+    erosivity_mean = baseline_erosivity,
+    apr_lag1 = baseline_apr_lag1,
+    erosivity_lag1 = baseline_erosivity_lag1,
+    log_apr = log10(apr_mean + 0.001),
+    log_rnf = log10(rnf_mean + 0.001),
+    log_erosivity = log10(erosivity_mean + 0.001),
+    erosivity_apr_interaction = erosivity_mean * apr_mean,
+    year_scaled = 0
+  ) %>%
+  st_drop_geometry() %>%
+  as.data.frame()
+
+dpredict_baseline <- xgb.DMatrix(
+  data = as.matrix(baseline_pred_data[, final_features, drop = FALSE])
+)
+
+prediction_2050$predicted_log_discharge_baseline <-
+  predict(xgb_final, dpredict_baseline)
 
 prediction_2050 <- prediction_2050 %>%
   mutate(
-    discharge_change = 10^predicted_discharge_2050 - 10^baseline_discharge,
-    discharge_change_pct = (10^predicted_discharge_2050 - 10^baseline_discharge) / 10^baseline_discharge * 100,
-    
-    risk_baseline = case_when(
-      10^baseline_discharge < quantile(10^baseline_discharge, 0.33, na.rm = TRUE) ~ "Low",
-      10^baseline_discharge < quantile(10^baseline_discharge, 0.67, na.rm = TRUE) ~ "Medium",
-      TRUE ~ "High"
-    ),
-    
-    risk_2050 = case_when(
-      10^predicted_discharge_2050 < quantile(10^baseline_discharge, 0.33, na.rm = TRUE) ~ "Low",
-      10^predicted_discharge_2050 < quantile(10^baseline_discharge, 0.67, na.rm = TRUE) ~ "Medium",
-      TRUE ~ "High"
-    ),
-    
-    region = if_else(abs(lat) > 23.5, "Temperate", "Tropical")
+    discharge_change_log =
+      predicted_log_discharge_2050 - predicted_log_discharge_baseline,
+    discharge_change_pct =
+      (10^discharge_change_log - 1) * 100
   )
 
-summary_stats <- prediction_2050 %>%
+# ============================================================================
+# Monte Carlo uncertainty quantification (1000 iterations)
+# ============================================================================
+
+monte_carlo_robust <- function(prediction_data_clean, cv_models,
+                               config, num_sims = 1000) {
+  n_sites <- nrow(prediction_data_clean)
+  sim_results <- matrix(NA, nrow = n_sites, ncol = num_sims)
+  
+  for (i in seq_len(num_sims)) {
+    noise_rcp <- rnorm(n_sites, 1, config$rcp45_erosivity_uncertainty_sd)
+    noise_apr <- rnorm(n_sites, 1, config$apr_uncertainty_sd)
+    noise_rnf <- rnorm(n_sites, 1, config$rnf_uncertainty_sd)
+    
+    sim_data <- prediction_data_clean %>%
+      mutate(
+        apr_sim = pmax(baseline_apr * noise_apr, 0.01),
+        rnf_sim = pmax(baseline_rnf * noise_rnf, 0.01),
+        erosivity_sim = pmax(baseline_erosivity * noise_rcp, 0.1),
+        log_apr = log10(apr_sim + 0.001),
+        log_rnf = log10(rnf_sim + 0.001),
+        log_erosivity = log10(erosivity_sim + 0.001),
+        erosivity_apr_interaction = erosivity_sim * apr_sim
+      )
+    
+    model <- cv_models[[sample(seq_along(cv_models), 1)]]
+    
+    dpredict_sim <- xgb.DMatrix(
+      data = as.matrix(sim_data[, final_features, drop = FALSE])
+    )
+    
+    sim_results[, i] <- predict(model, dpredict_sim)
+  }
+  
+  uncertainty <- data.frame(
+    mean_pred = rowMeans(sim_results),
+    lower_ci = apply(sim_results, 1, quantile, 0.025),
+    upper_ci = apply(sim_results, 1, quantile, 0.975),
+    sd_pred = apply(sim_results, 1, sd)
+  )
+  
+  return(uncertainty)
+}
+
+mc_uncertainty <- monte_carlo_robust(
+  prediction_data_clean = prediction_2050 %>% st_drop_geometry(),
+  cv_models = xgb_models,
+  config = config,
+  num_sims = config$monte_carlo_sims
+)
+
+prediction_2050 <- prediction_2050 %>%
+  bind_cols(mc_uncertainty) %>%
+  mutate(
+    discharge_change_pct_lower = (10^(lower_ci - predicted_log_discharge_baseline) - 1) * 100,
+    discharge_change_pct_upper = (10^(upper_ci - predicted_log_discharge_baseline) - 1) * 100
+  )
+
+# --- Regional summary ---
+regional_summary <- prediction_2050 %>%
+  st_drop_geometry() %>%
+  group_by(region) %>%
   summarise(
-    mean_discharge_change_pct = mean(discharge_change_pct, na.rm = TRUE),
-    median_discharge_change_pct = median(discharge_change_pct, na.rm = TRUE),
-    mean_erosivity_change_pct = mean(erosivity_change_pct, na.rm = TRUE),
-    median_erosivity_change_pct = median(erosivity_change_pct, na.rm = TRUE),
-    sites_with_increased_risk = sum(discharge_change_pct > 0, na.rm = TRUE),
-    total_sites = n(),
-    sites_with_increased_risk_pct = (sites_with_increased_risk / total_sites) * 100,
-    mean_discharge_change = mean(discharge_change, na.rm = TRUE),
-    median_discharge_change = median(discharge_change, na.rm = TRUE),
+    n_sites = n(),
+    mean_change_pct = mean(discharge_change_pct, na.rm = TRUE),
+    median_change_pct = median(discharge_change_pct, na.rm = TRUE),
+    sites_increasing = sum(discharge_change_pct > 0, na.rm = TRUE),
+    pct_increasing = (sites_increasing / n()) * 100,
+    ci_lower = mean(discharge_change_pct_lower, na.rm = TRUE),
+    ci_upper = mean(discharge_change_pct_upper, na.rm = TRUE),
     .groups = "drop"
   )
 
-transition_matrix <- table(prediction_2050$risk_baseline, prediction_2050$risk_2050)
-
-# ============================================================================
-# Monte Carlo uncertainity (1000 simulations)
-# ============================================================================
-
-monte_carlo_sim <- function(prediction_data, xgb_model_package, num_sims = 1000) {
-  sim_results <- replicate(num_sims, {
-    noise_erosivity <- rnorm(nrow(prediction_data), mean = 0, 
-                            sd = sd(prediction_data$erosivity_2050, na.rm = TRUE) * 0.1)
-    sim_erosivity <- pmax(prediction_data$erosivity_2050 + noise_erosivity, 0)
-    
-    sim_data <- prediction_data %>%
-      mutate(erosivity_mean = sim_erosivity,
-             erosivity_apr_interaction = sim_erosivity * apr_mean,
-             erosivity_rnf_interaction = sim_erosivity * rnf_mean)
-    
-    dpredict_sim <- xgb.DMatrix(data = as.matrix(sim_data[, selected_features]))
-    sim_prediction <- predict(xgb_model_package$model, dpredict_sim)
-    return(sim_prediction)
-  })
-  
-  sim_df <- t(apply(sim_results, 1, function(x) {
-    c(mean_pred = mean(x),
-      lower_ci = quantile(x, 0.025),
-      upper_ci = quantile(x, 0.975))
-  }))
-  
-  return(as.data.frame(sim_df))
-}
-
-mc_results <- monte_carlo_sim(prediction_2050, xgb_package, num_sims = 1000)
-
-if (nrow(mc_results) == nrow(prediction_2050)) {
-  prediction_2050 <- prediction_2050 %>%
-    mutate(
-      predicted_discharge_2050_mc_mean = mc_results$mean_pred,
-      predicted_discharge_2050_lower_ci = mc_results$lower_ci,
-      predicted_discharge_2050_upper_ci = mc_results$upper_ci,
-      discharge_change_pct_mc = (10^predicted_discharge_2050_mc_mean - 10^baseline_discharge) / 10^baseline_discharge * 100
-    )
-}
-
-mc_summary <- prediction_2050 %>%
+# --- Global summary ---
+global_summary <- prediction_2050 %>%
+  st_drop_geometry() %>%
   summarise(
-    mean_discharge_change_pct_mc = mean(discharge_change_pct_mc, na.rm = TRUE),
-    sd_discharge_change_pct_mc = sd(discharge_change_pct_mc, na.rm = TRUE),
-    median_discharge_change_pct_mc = median(discharge_change_pct_mc, na.rm = TRUE),
-    lower_ci_95 = quantile(discharge_change_pct_mc, 0.025, na.rm = TRUE),
-    upper_ci_95 = quantile(discharge_change_pct_mc, 0.975, na.rm = TRUE),
-    n_observations = n()
+    n_sites = n(),
+    mean_change_pct = mean(discharge_change_pct, na.rm = TRUE),
+    median_change_pct = median(discharge_change_pct, na.rm = TRUE),
+    sites_increasing = sum(discharge_change_pct > 0, na.rm = TRUE),
+    pct_increasing = (sites_increasing / n()) * 100,
+    ci_lower = mean(discharge_change_pct_lower, na.rm = TRUE),
+    ci_upper = mean(discharge_change_pct_upper, na.rm = TRUE)
   )
 
 # ============================================================================
-# Xgboost vs linear regression
+# Linear model comparison
 # ============================================================================
 
-formula_linear <- as.formula(paste("log_sum_discharge ~", 
-                                   paste(selected_features, collapse = " + ")))
-linear_final <- lm(formula_linear, data = model_data)
+linear_final <- lm(
+  log_discharge ~ .,
+  data = data_train_clean[, c("log_discharge", final_features)]
+)
 
 prediction_2050$predicted_discharge_2050_linear <- predict(
-  linear_final, 
-  newdata = prediction_2050
+  linear_final,
+  newdata = pred_check
+)
+
+prediction_2050$predicted_discharge_baseline_linear <- predict(
+  linear_final,
+  newdata = baseline_pred_data
 )
 
 prediction_2050 <- prediction_2050 %>%
   mutate(
-    discharge_change_pct_linear = (10^predicted_discharge_2050_linear - 10^baseline_discharge) / 
-                                  10^baseline_discharge * 100,
+    discharge_change_pct_linear = 
+      (10^(predicted_discharge_2050_linear - predicted_discharge_baseline_linear) - 1) * 100,
     model_agreement = sign(discharge_change_pct) == sign(discharge_change_pct_linear)
   )
 
-model_comparison_2050 <- data.frame(
-  Model = c("XGBoost_Full", "Linear"),
+model_comparison <- data.frame(
+  Model = c("XGBoost", "Linear"),
   Mean_Change_Pct = c(
     mean(prediction_2050$discharge_change_pct, na.rm = TRUE),
     mean(prediction_2050$discharge_change_pct_linear, na.rm = TRUE)
@@ -755,8 +704,12 @@ model_comparison_2050 <- data.frame(
     median(prediction_2050$discharge_change_pct, na.rm = TRUE),
     median(prediction_2050$discharge_change_pct_linear, na.rm = TRUE)
   ),
-  Sites_Increased_Risk = c(
+  Sites_Increased = c(
     sum(prediction_2050$discharge_change_pct > 0, na.rm = TRUE),
-    sum(prediction_2050$discharge_change_pct_linear > 0, na.rm = TRUE))
+    sum(prediction_2050$discharge_change_pct_linear > 0, na.rm = TRUE)
+  ),
+  Directional_Agreement_Pct = c(
+    NA,
+    mean(prediction_2050$model_agreement, na.rm = TRUE) * 100
   )
 )
