@@ -422,6 +422,267 @@ fit_gam_models <- function(data, k_spatial = 100) {
 }
 
 # ============================================================================
+# Basis Dimension Diagnostics (k.check)
+# ============================================================================
+
+check_basis_adequacy <- function(model, group_name) {
+  k_check_result <- k.check(model)
+  
+  basis_diagnostics <- data.frame(
+    Group = group_name,
+    Smooth = rownames(k_check_result),
+    k_prime = k_check_result[, "k'"],
+    edf = k_check_result[, "edf"],
+    k_index = k_check_result[, "k-index"],
+    p_value = k_check_result[, "p-value"]
+  )
+  
+  basis_adequate <- all(basis_diagnostics$p_value > 0.05, na.rm = TRUE)
+  
+  return(list(
+    diagnostics = basis_diagnostics,
+    adequate = basis_adequate
+  ))
+}
+
+# Run k.check for all phytoplankton groups
+basis_check_results <- list()
+
+for (group_name in names(all_results)) {
+  if (!is.null(all_results[[group_name]]$best_model)) {
+    best_model <- all_results[[group_name]]$best_model
+    
+    basis_check <- check_basis_adequacy(best_model, group_name)
+    basis_check_results[[group_name]] <- basis_check
+    
+    all_results[[group_name]]$basis_diagnostics <- basis_check$diagnostics
+    all_results[[group_name]]$basis_adequate <- basis_check$adequate
+  }
+}
+
+# Combine all diagnostics into summary table
+basis_diagnostics_summary <- do.call(rbind, lapply(basis_check_results, function(x) x$diagnostics))
+
+# Check if any groups have inadequate basis dimensions
+inadequate_groups <- sapply(basis_check_results, function(x) !x$adequate)
+
+################################################################################
+# Model validation and overfitting check
+################################################################################
+
+# function to extract comprehensive model diagnostics
+extract_model_diagnostics <- function(model, data, phyto_name) {
+  
+  # 1. Effective degrees of freedom (EDF)
+  edf_total <- sum(model$edf)
+  n_obs <- nrow(data)
+  overfitting_ratio <- edf_total / n_obs
+  
+  # 2. AIC/BIC metrics
+  aic <- AIC(model)
+  bic <- BIC(model)
+  
+  # 3. Explained deviance vs adjusted R²
+  dev_expl <- summary(model)$dev.expl * 100
+  r2_adj <- summary(model)$r.sq
+  
+  # 4. GCV score (generalized cross-validation)
+  gcv <- model$gcv.ubre
+  
+  # 5. Scale parameter (dispersion)
+  scale_param <- model$scale
+  
+  # 6. Concurvity (GAM collinearity check)
+  tryCatch({
+    concurv <- concurvity(model, full = FALSE)
+    # concurv is a list of matrices, get maximum worst case
+    if (is.list(concurv)) {
+      max_concurv <- max(sapply(concurv, function(x) max(x[x < 1], na.rm = TRUE)), na.rm = TRUE)
+    } else {
+      max_concurv <- max(concurv[concurv < 1], na.rm = TRUE)
+    }
+  }, error = function(e) {
+    max_concurv <- NA
+  })
+  }
+  
+  return(tibble(
+    phyto_type = phyto_name,
+    n_obs = n_obs,
+    edf = edf_total,
+    overfitting_ratio = overfitting_ratio,
+    aic = aic,
+    bic = bic,
+    dev_expl = dev_expl,
+    r2_adj = r2_adj,
+    gcv = gcv,
+    max_concurvity = max_concurv,
+    overfitting_status = case_when(
+      overfitting_ratio < 0.1 ~ "Good",
+      overfitting_ratio < 0.2 ~ "Acceptable",
+      TRUE ~ "Overfitted"
+    )
+  ))
+}
+
+# Extract diagnostics for all best models
+diagnostics_list <- list()
+
+for (phyto_name in names(model_results)) {
+  best_model <- model_results[[phyto_name]]$best_model
+  data_phyto <- integrated_clean %>% filter(phyto_type == phyto_name)
+  
+  diagnostics_list[[phyto_name]] <- extract_model_diagnostics(
+    best_model, data_phyto, phyto_name
+  )
+}
+
+diagnostics_df <- bind_rows(diagnostics_list)
+
+
+# ============================================================================
+# Buffer sensitivity analysis (25, 50, 75 km)
+# ============================================================================
+
+buffer_sensitivity_analysis <- function(group_data, discharge_sf, sst_stack,
+                                       buffers = c(25000, 50000, 75000)) {
+  
+  sensitivity_results <- list()
+  
+  for (buffer_m in buffers) {
+    
+    # Re-aggregate discharge at this buffer size
+    discharge_proj <- st_transform(discharge_sf, crs = 3857)
+    group_sf <- st_as_sf(group_data, coords = c("lon", "lat"), crs = 4326, remove = FALSE) %>%
+      st_transform(crs = 3857)
+    
+    buffers_geom <- st_buffer(group_sf, dist = buffer_m)
+    
+    discharge_spatial <- discharge_sf %>%
+      st_transform(crs = 3857)
+    
+    joined <- st_join(buffers_geom, discharge_spatial, join = st_intersects)
+    
+    aggregated <- joined %>%
+      st_drop_geometry() %>%
+      group_by(lon, lat, year) %>%
+      summarise(
+        herbicide_discharge_mean = mean(sum_discharge, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      filter(!is.na(herbicide_discharge_mean))
+    
+    # Merge with chlorophyll
+    merged_data <- group_data %>%
+      left_join(aggregated, by = c("lon", "lat", "year")) %>%
+      filter(!is.na(herbicide_discharge_mean)) %>%
+      mutate(
+        log_herbicide_discharge = log10(herbicide_discharge_mean + 0.001),
+        lon_scaled = scale(lon)[,1],
+        lat_scaled = scale(lat)[,1]
+      )
+    
+    if (nrow(merged_data) < 100) {
+      sensitivity_results[[paste0(buffer_m/1000, "km")]] <- list(
+        buffer_km = buffer_m/1000,
+        n_obs = nrow(merged_data),
+        fitted = FALSE
+      )
+      next
+    }
+    
+    # Fit interaction model at this buffer
+    model_buffer <- tryCatch({
+      bam(
+        log_chlorophyll ~ 
+          te(log_herbicide_discharge, sst, bs = "tp", k = 10) +
+          s(lon_scaled, lat_scaled, bs = "gp", k = 100, m = c(2, 0.1)),
+        data = merged_data,
+        method = "fREML",
+        discrete = TRUE,
+        nthreads = 4
+      )
+    }, error = function(e) NULL)
+    
+    if (!is.null(model_buffer)) {
+      # Extract interaction statistics
+      sm <- summary(model_buffer)
+      te_row <- grep("^te\\(", rownames(sm$s.table))
+      
+      if (length(te_row) > 0) {
+        f_val <- sm$s.table[te_row[1], "F"]
+        p_val <- sm$s.table[te_row[1], "p-value"]
+        edf <- sm$s.table[te_row[1], "edf"]
+      } else {
+        f_val <- NA
+        p_val <- NA
+        edf <- NA
+      }
+      
+      sensitivity_results[[paste0(buffer_m/1000, "km")]] <- list(
+        buffer_km = buffer_m/1000,
+        n_obs = nrow(merged_data),
+        R2 = summary(model_buffer)$r.sq,
+        dev_expl = summary(model_buffer)$dev.expl,
+        AIC = AIC(model_buffer),
+        interaction_F = f_val,
+        interaction_p = p_val,
+        interaction_edf = edf,
+        fitted = TRUE
+      )
+    } else {
+      sensitivity_results[[paste0(buffer_m/1000, "km")]] <- list(
+        buffer_km = buffer_m/1000,
+        n_obs = nrow(merged_data),
+        fitted = FALSE
+      )
+    }
+  }
+  
+  return(sensitivity_results)
+}
+
+# Run buffer sensitivity for each phytoplankton group
+buffer_sensitivity_results <- list()
+
+for (group_name in names(model_data_list)) {
+  group_data <- model_data_list[[group_name]]
+  
+  if (nrow(group_data) >= 100) {
+    buffer_sensitivity_results[[group_name]] <- buffer_sensitivity_analysis(
+      group_data = group_data,
+      discharge_sf = discharge,
+      sst_stack = sst_stack,
+      buffers = c(25000, 50000, 75000)
+    )
+    
+    all_results[[group_name]]$buffer_sensitivity <- buffer_sensitivity_results[[group_name]]
+  }
+}
+
+# Create summary table
+buffer_sensitivity_summary <- do.call(rbind, lapply(names(buffer_sensitivity_results), function(g) {
+  do.call(rbind, lapply(names(buffer_sensitivity_results[[g]]), function(b) {
+    res <- buffer_sensitivity_results[[g]][[b]]
+    if (res$fitted) {
+      data.frame(
+        Group = g,
+        Buffer_km = res$buffer_km,
+        N_obs = res$n_obs,
+        R2 = res$R2,
+        Dev_expl = res$dev_expl,
+        AIC = res$AIC,
+        Interaction_F = res$interaction_F,
+        Interaction_p = res$interaction_p,
+        Interaction_significant = res$interaction_p < 0.05
+      )
+    } else {
+      NULL
+    }
+  }))
+}))
+
+# ============================================================================
 # Residual spatial autocorrelation assessment (Moran's I, k=8)
 # ============================================================================
 
@@ -732,47 +993,144 @@ buffer_sensitivity_analysis <- function(group_data, discharge_data, buffers = c(
 # Nutrient confounding analysis
 # ============================================================================
 
-nutrient_confounding_analysis <- function(model_data_with_nutrients) {
-  # VIF assessment
-  vif_check <- car::vif(lm(log_chlorophyll ~ log_herbicide_discharge + sst + 
-                            nitrate + phosphate + silicate, 
-                          data = model_data_with_nutrients))
+# ============================================================================
+# Nutrient Confounding Analysis
+# ============================================================================
+
+# Merge all nutrients
+nutrients <- nitrate %>%
+  inner_join(phosphate, by = c("lon", "lat", "year")) %>%
+  inner_join(silicate, by = c("lon", "lat", "year")) %>%
+  filter(complete.cases(.))
+
+# Assess nutrient data coverage
+nutrient_coverage <- list()
+
+for (group_name in names(model_data_list)) {
+  group_data <- model_data_list[[group_name]] %>%
+    mutate(lon = round(lon, 4), lat = round(lat, 4))
   
-  # Nested model comparison
-  mod_nutrient_only <- bam(
-    log_chlorophyll ~ s(nitrate, k=10) + s(phosphate, k=10) + s(silicate, k=10) +
-      lat_band + s(lon_scaled, lat_scaled, k=50, bs='gp', m=c(2, 0.1)),
-    data = model_data_with_nutrients,
-    method = "fREML"
+  # Merge with nutrients
+  data_with_nutrients <- group_data %>%
+    inner_join(nutrients, by = c("lon", "lat", "year"))
+  
+  n_total <- nrow(group_data)
+  n_nutrients <- nrow(data_with_nutrients)
+  pct_coverage <- (n_nutrients / n_total) * 100
+  
+  nutrient_coverage[[group_name]] <- list(
+    n_total = n_total,
+    n_with_nutrients = n_nutrients,
+    pct_coverage = pct_coverage
   )
   
-  mod_herbicide_temp <- bam(
-    log_chlorophyll ~ s(log_herbicide_discharge, k=10) + s(sst, k=10) +
-      lat_band + s(lon_scaled, lat_scaled, k=50, bs='gp', m=c(2, 0.1)),
-    data = model_data_with_nutrients,
-    method = "fREML"
-  )
-  
-  mod_all_additive <- bam(
-    log_chlorophyll ~ s(log_herbicide_discharge, k=10) + s(sst, k=10) +
-      s(nitrate, k=10) + s(phosphate, k=10) + s(silicate, k=10) +
-      lat_band + s(lon_scaled, lat_scaled, k=50, bs='gp', m=c(2, 0.1)),
-    data = model_data_with_nutrients,
-    method = "fREML"
-  )
-  
-  # Akaike weights
-  aic_vals <- c(AIC(mod_nutrient_only), AIC(mod_herbicide_temp), AIC(mod_all_additive))
-  delta_aic <- aic_vals - min(aic_vals)
-  weights <- exp(-0.5 * delta_aic) / sum(exp(-0.5 * delta_aic))
-  
-  evidence_ratio <- weights[2] / weights[1]
-  
-  return(list(
-    vif = vif_check,
-    akaike_weights = weights,
-    evidence_ratio = evidence_ratio,
-    delta_r2 = summary(mod_all_additive)$r.sq - summary(mod_nutrient_only)$r.sq
-  ))
+  # Only analyze if sufficient data (n >= 30)
+  if (n_nutrients >= 30) {
+    
+    # VIF analysis
+    vif_data <- data_with_nutrients %>%
+      select(log_herbicide_discharge, sst, nitrate, phosphate, silicate) %>%
+      filter(complete.cases(.))
+    
+    if (nrow(vif_data) >= 30) {
+      vif_model <- lm(log_chlorophyll ~ log_herbicide_discharge + sst + 
+                      nitrate + phosphate + silicate, data = data_with_nutrients)
+      vif_values <- car::vif(vif_model)
+      
+      # Nested model comparison
+      mod_nutrients_only <- bam(
+        log_chlorophyll ~ s(nitrate, k = 5) + s(phosphate, k = 5) + s(silicate, k = 5) +
+          s(lon_scaled, lat_scaled, bs = "gp", k = 50, m = c(2, 0.1)),
+        data = data_with_nutrients,
+        method = "fREML",
+        discrete = TRUE,
+        nthreads = 2
+      )
+      
+      mod_herbicide_sst <- bam(
+        log_chlorophyll ~ s(log_herbicide_discharge, k = 5) + s(sst, k = 5) +
+          s(lon_scaled, lat_scaled, bs = "gp", k = 50, m = c(2, 0.1)),
+        data = data_with_nutrients,
+        method = "fREML",
+        discrete = TRUE,
+        nthreads = 2
+      )
+      
+      mod_all_additive <- bam(
+        log_chlorophyll ~ s(log_herbicide_discharge, k = 5) + s(sst, k = 5) +
+          s(nitrate, k = 5) + s(phosphate, k = 5) + s(silicate, k = 5) +
+          s(lon_scaled, lat_scaled, bs = "gp", k = 50, m = c(2, 0.1)),
+        data = data_with_nutrients,
+        method = "fREML",
+        discrete = TRUE,
+        nthreads = 2
+      )
+      
+      # AIC comparison
+      aic_nutrients <- AIC(mod_nutrients_only)
+      aic_herb_sst <- AIC(mod_herbicide_sst)
+      aic_all <- AIC(mod_all_additive)
+      
+      # Calculate Akaike weights
+      delta_aic <- c(
+        nutrients = aic_nutrients - min(c(aic_nutrients, aic_herb_sst, aic_all)),
+        herb_sst = aic_herb_sst - min(c(aic_nutrients, aic_herb_sst, aic_all)),
+        all = aic_all - min(c(aic_nutrients, aic_herb_sst, aic_all))
+      )
+      
+      akaike_weights <- exp(-0.5 * delta_aic) / sum(exp(-0.5 * delta_aic))
+      
+      # Evidence ratio (herbicide model vs nutrients model)
+      evidence_ratio <- akaike_weights["herb_sst"] / akaike_weights["nutrients"]
+      
+      # R² improvement
+      r2_nutrients <- summary(mod_nutrients_only)$r.sq
+      r2_herb_sst <- summary(mod_herbicide_sst)$r.sq
+      r2_all <- summary(mod_all_additive)$r.sq
+      
+      delta_r2_herb_over_nutrients <- r2_herb_sst - r2_nutrients
+      delta_r2_all_over_nutrients <- r2_all - r2_nutrients
+      
+      nutrient_coverage[[group_name]]$confounding_analysis <- list(
+        vif = vif_values,
+        max_vif = max(vif_values),
+        aic = c(nutrients = aic_nutrients, herb_sst = aic_herb_sst, all = aic_all),
+        delta_aic = delta_aic,
+        akaike_weights = akaike_weights,
+        evidence_ratio = evidence_ratio,
+        r2 = c(nutrients = r2_nutrients, herb_sst = r2_herb_sst, all = r2_all),
+        delta_r2_herb = delta_r2_herb_over_nutrients,
+        delta_r2_all = delta_r2_all_over_nutrients
+      )
+      
+      all_results[[group_name]]$nutrient_confounding <- nutrient_coverage[[group_name]]$confounding_analysis
+    }
+  }
 }
 
+# Create coverage summary
+nutrient_coverage_summary <- do.call(rbind, lapply(names(nutrient_coverage), function(g) {
+  cov <- nutrient_coverage[[g]]
+  data.frame(
+    Group = g,
+    N_total = cov$n_total,
+    N_with_nutrients = cov$n_with_nutrients,
+    Pct_coverage = round(cov$pct_coverage, 2)
+  )
+}))
+
+# Create confounding summary (only groups with analysis)
+nutrient_confounding_summary <- do.call(rbind, lapply(names(nutrient_coverage), function(g) {
+  if (!is.null(nutrient_coverage[[g]]$confounding_analysis)) {
+    conf <- nutrient_coverage[[g]]$confounding_analysis
+    data.frame(
+      Group = g,
+      Max_VIF = round(conf$max_vif, 2),
+      Evidence_ratio = round(conf$evidence_ratio, 2),
+      Delta_R2_herb = round(conf$delta_r2_herb, 4),
+      Herb_SST_weight = round(conf$akaike_weights["herb_sst"], 3)
+    )
+  } else {
+    NULL
+  }
+}))
