@@ -496,6 +496,58 @@ importance_final <- gain_df %>%
   arrange(desc(SHAP_MeanAbs))
 
 # ============================================================================
+# Extrapolation Diagnostics
+# ============================================================================
+
+training_ranges <- data_train_clean %>%
+  summarise(across(
+    all_of(final_features),
+    list(min = ~min(., na.rm = TRUE), 
+         max = ~max(., na.rm = TRUE)),
+    .names = "{.col}_{.fn}"
+  ))
+
+pred_check <- prediction_2050 %>%
+  st_drop_geometry() %>%
+  as.data.frame()
+
+extrap_summary <- data.frame()
+
+for(feat in final_features) {
+  min_train <- training_ranges[[paste0(feat, "_min")]]
+  max_train <- training_ranges[[paste0(feat, "_max")]]
+  
+  pred_values <- as.numeric(pred_check[[feat]])
+  
+  n_below <- sum(pred_values < min_train, na.rm = TRUE)
+  n_above <- sum(pred_values > max_train, na.rm = TRUE)
+  n_total <- n_below + n_above
+  
+  extrap_summary <- rbind(extrap_summary, data.frame(
+    Feature = feat,
+    N_Below = n_below,
+    N_Above = n_above,
+    Total_Sites = n_total,
+    Pct_Sites = round(n_total / nrow(pred_check) * 100, 1),
+    Train_Min = round(min_train, 3),
+    Train_Max = round(max_train, 3),
+    Pred_Min = round(min(pred_values, na.rm = TRUE), 3),
+    Pred_Max = round(max(pred_values, na.rm = TRUE), 3)
+  ))
+}
+
+any_extrap <- rowSums(sapply(final_features, function(f) {
+  pred_check[[f]] < training_ranges[[paste0(f, "_min")]] | 
+  pred_check[[f]] > training_ranges[[paste0(f, "_max")]]
+}), na.rm = TRUE) > 0
+
+extrapolation_summary <- data.frame(
+  total_sites = nrow(pred_check),
+  sites_extrapolating = sum(any_extrap),
+  pct_extrapolating = mean(any_extrap) * 100
+)
+
+# ============================================================================
 # 2050 Projections (RCP4.5)
 # ============================================================================
 
@@ -669,6 +721,194 @@ global_summary <- prediction_2050 %>%
   )
 
 # ============================================================================
+# Uncertainty decomposition (variance contribution analysis)
+# ============================================================================
+
+monte_carlo_partial <- function(prediction_data_clean,
+                                cv_models,
+                                baseline_cv_data,
+                                metrics_test,
+                                config,
+                                final_features,
+                                num_sims = 1000,
+                                include_climate = TRUE,
+                                include_baseline_var = TRUE,
+                                include_predictor = TRUE,
+                                include_model = TRUE,
+                                include_residual = TRUE) {
+  
+  n_sites <- nrow(prediction_data_clean)
+  sim_results <- matrix(NA_real_, n_sites, num_sims)
+  
+  # Calculate baseline coefficient of variation for erosivity
+  baseline_variability <- baseline_cv_data %>%
+    group_by(location_id) %>%
+    summarise(
+      cv_erosivity = sd(erosivity_mean, na.rm = TRUE) / 
+                     mean(erosivity_mean, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      cv_erosivity = if_else(
+        is.na(cv_erosivity) | is.infinite(cv_erosivity),
+        0.15, cv_erosivity
+      ),
+      cv_erosivity = pmin(cv_erosivity, 0.30)
+    )
+  
+  pred_with_cv <- prediction_data_clean %>%
+    left_join(baseline_variability, by = "location_id") %>%
+    mutate(
+      cv_erosivity = if_else(
+        is.na(cv_erosivity),
+        median(baseline_variability$cv_erosivity, na.rm = TRUE),
+        cv_erosivity
+      )
+    )
+  
+  for (i in seq_len(num_sims)) {
+    
+    # Uncertainty switches (turn on/off different sources)
+    noise_rcp <- if (include_climate)
+      rnorm(n_sites, 1, config$rcp45_erosivity_uncertainty_sd) else 1
+    
+    noise_baseline <- if (include_baseline_var)
+      rnorm(n_sites, 1, pred_with_cv$cv_erosivity) else 1
+    
+    noise_apr <- if (include_predictor)
+      rnorm(n_sites, 1, config$apr_uncertainty_sd) else 1
+    
+    noise_rnf <- if (include_predictor)
+      rnorm(n_sites, 1, config$rnf_uncertainty_sd) else 1
+    
+    # Rebuild predictors with selected uncertainty sources
+    sim_data <- data.frame(
+      location_id = pred_with_cv$location_id,
+      
+      apr_sim = pmax(pred_with_cv$baseline_apr * noise_apr, 0.01),
+      rnf_sim = pmax(pred_with_cv$baseline_rnf * noise_rnf, 0.01),
+      
+      erosivity_sim = pmax(
+        pred_with_cv$baseline_erosivity * noise_baseline * noise_rcp,
+        0.1
+      ),
+      
+      apr_lag1 = pred_with_cv$apr_lag1,
+      erosivity_lag1 = pred_with_cv$erosivity_lag1,
+      
+      year_scaled = 0
+    )
+    
+    # Derived features
+    sim_data$log_apr <- log10(sim_data$apr_sim + 0.001)
+    sim_data$log_rnf <- log10(sim_data$rnf_sim + 0.001)
+    sim_data$log_erosivity <- log10(sim_data$erosivity_sim + 0.001)
+    sim_data$erosivity_apr_interaction <- sim_data$erosivity_sim * sim_data$apr_sim
+    
+    # Model uncertainty
+    model <- if (include_model) {
+      cv_models[[sample(seq_along(cv_models), 1)]]
+    } else {
+      cv_models[[1]]
+    }
+    
+    # Build feature matrix
+    X_sim <- matrix(
+      NA_real_,
+      nrow = n_sites,
+      ncol = length(final_features),
+      dimnames = list(NULL, final_features)
+    )
+    
+    for (f in final_features) {
+      X_sim[, f] <- as.numeric(sim_data[[f]])
+    }
+    
+    dpredict_sim <- xgb.DMatrix(data = X_sim)
+    base_pred <- predict(model, dpredict_sim)
+    
+    # Residual uncertainty
+    residual_noise <- if (include_residual)
+      rnorm(n_sites, 0, metrics_test$RMSE * 0.20) else 0
+    
+    sim_results[, i] <- base_pred + residual_noise
+  }
+  
+  apply(sim_results, 1, sd, na.rm = TRUE)
+}
+
+# Run leave-one-out uncertainty decomposition
+run_mc_variance <- function(flags, prediction_data_clean, cv_models, 
+                           baseline_cv_data, metrics_test, config, 
+                           final_features, num_sims = 1000) {
+  sd_vec <- monte_carlo_partial(
+    prediction_data_clean = prediction_data_clean,
+    cv_models = cv_models,
+    baseline_cv_data = baseline_cv_data,
+    metrics_test = metrics_test,
+    config = config,
+    final_features = final_features,
+    num_sims = num_sims,
+    include_climate = flags["climate"],
+    include_baseline_var = flags["baseline"],
+    include_predictor = flags["predictor"],
+    include_model = flags["model"],
+    include_residual = flags["residual"]
+  )
+  mean(sd_vec^2, na.rm = TRUE)
+}
+
+# Total variance (all sources active)
+var_total <- run_mc_variance(
+  flags = c(climate = TRUE, baseline = TRUE, predictor = TRUE, 
+           model = TRUE, residual = TRUE),
+  prediction_data_clean = prediction_2050 %>% st_drop_geometry(),
+  cv_models = xgb_models,
+  baseline_cv_data = data_train %>% st_drop_geometry(),
+  metrics_test = metrics_test_cv,
+  config = config,
+  final_features = final_features,
+  num_sims = 1000
+)
+
+# Leave-one-out: remove each source and measure variance reduction
+uncertainty_sources <- list(
+  Climate = c(climate = FALSE, baseline = TRUE, predictor = TRUE, 
+             model = TRUE, residual = TRUE),
+  Baseline = c(climate = TRUE, baseline = FALSE, predictor = TRUE, 
+              model = TRUE, residual = TRUE),
+  Predictor = c(climate = TRUE, baseline = TRUE, predictor = FALSE, 
+               model = TRUE, residual = TRUE),
+  Model = c(climate = TRUE, baseline = TRUE, predictor = TRUE, 
+           model = FALSE, residual = TRUE),
+  Residual = c(climate = TRUE, baseline = TRUE, predictor = TRUE, 
+              model = TRUE, residual = FALSE)
+)
+
+var_removed <- sapply(uncertainty_sources, function(flags) {
+  run_mc_variance(
+    flags = flags,
+    prediction_data_clean = prediction_2050 %>% st_drop_geometry(),
+    cv_models = xgb_models,
+    baseline_cv_data = data_train %>% st_drop_geometry(),
+    metrics_test = metrics_test_cv,
+    config = config,
+    final_features = final_features,
+    num_sims = 1000
+  )
+})
+
+uncertainty_decomposition <- data.frame(
+  Source = names(var_removed),
+  Variance_Contribution = var_total - var_removed
+) %>%
+  mutate(
+    Percent = (Variance_Contribution / sum(Variance_Contribution)) * 100,
+    SD_logscale = sqrt(Variance_Contribution)
+  ) %>%
+  arrange(desc(Percent))
+  
+# ============================================================================
 # Linear model comparison
 # ============================================================================
 
@@ -711,5 +951,202 @@ model_comparison <- data.frame(
   Directional_Agreement_Pct = c(
     NA,
     mean(prediction_2050$model_agreement, na.rm = TRUE) * 100
+  )
+)
+
+# ============================================================================
+# APR sensitivity analysis (±20% scenarios)
+# ============================================================================
+
+# Prepare baseline prediction for comparison
+X_baseline <- matrix(
+  NA_real_,
+  nrow = nrow(pred_check),
+  ncol = length(final_features),
+  dimnames = list(NULL, final_features)
+)
+
+for (f in final_features) {
+  X_baseline[, f] <- as.numeric(pred_check[[f]])
+}
+
+baseline_predictions <- predict(xgb_final, xgb.DMatrix(X_baseline))
+
+# APR sensitivity scenarios
+apr_scenarios <- c(0.8, 0.9, 1.0, 1.1, 1.2)
+apr_sensitivity_results <- list()
+
+for (apr_factor in apr_scenarios) {
+  
+  # Modify APR while keeping other predictors constant
+  scenario_data <- pred_check %>%
+    mutate(
+      apr_mean_sim = pmax(baseline_apr * apr_factor, 0.01),
+      
+      # Recalculate derived features
+      log_apr = log10(apr_mean_sim + 0.001),
+      log_rnf = log10(baseline_rnf + 0.001),
+      log_erosivity = log10(baseline_erosivity + 0.001),
+      
+      # Update interaction term
+      erosivity_apr_interaction = baseline_erosivity * apr_mean_sim,
+      
+      # Keep other features unchanged
+      apr_lag1 = apr_lag1,
+      erosivity_lag1 = erosivity_lag1,
+      year_scaled = 0
+    )
+  
+  # Build feature matrix for this scenario
+  X_scenario <- matrix(
+    NA_real_,
+    nrow = nrow(scenario_data),
+    ncol = length(final_features),
+    dimnames = list(NULL, final_features)
+  )
+  
+  for (f in final_features) {
+    X_scenario[, f] <- as.numeric(scenario_data[[f]])
+  }
+  
+  # Predict
+  scenario_predictions <- predict(xgb_final, xgb.DMatrix(X_scenario))
+  
+  # Calculate changes in percent space (converting from log scale)
+  changes <- data.frame(
+    predicted_log = scenario_predictions,
+    baseline_log = baseline_predictions
+  ) %>%
+    filter(baseline_log >= -2) %>%
+    mutate(
+      change_pct = ((10^predicted_log) - (10^baseline_log)) / (10^baseline_log) * 100
+    )
+  
+  # Store results
+  apr_sensitivity_results[[as.character(apr_factor)]] <- data.frame(
+    Scenario = paste0("APR ", apr_factor, "x"),
+    APR_Factor = apr_factor,
+    Mean_Change_Pct = mean(changes$change_pct, na.rm = TRUE),
+    Median_Change_Pct = median(changes$change_pct, na.rm = TRUE),
+    SD_Change_Pct = sd(changes$change_pct, na.rm = TRUE),
+    Sites_Increase = sum(changes$change_pct > 0, na.rm = TRUE),
+    Sites_Decrease = sum(changes$change_pct < 0, na.rm = TRUE),
+    Pct_Increase = mean(changes$change_pct > 0, na.rm = TRUE) * 100,
+    Q25_Change = quantile(changes$change_pct, 0.25, na.rm = TRUE),
+    Q75_Change = quantile(changes$change_pct, 0.75, na.rm = TRUE)
+  )
+}
+
+apr_sensitivity_summary <- do.call(rbind, apr_sensitivity_results)
+
+# Calculate marginal sensitivity (% discharge change per 1% APR change)
+apr_marginal_sensitivity <- data.frame(
+  APR_Change = c(-20, -10, 0, 10, 20),
+  Mean_Discharge_Change = apr_sensitivity_summary$Mean_Change_Pct,
+  Marginal_Effect = c(
+    NA,
+    (apr_sensitivity_summary$Mean_Change_Pct[2] - apr_sensitivity_summary$Mean_Change_Pct[1]) / 10,
+    (apr_sensitivity_summary$Mean_Change_Pct[3] - apr_sensitivity_summary$Mean_Change_Pct[2]) / 10,
+    (apr_sensitivity_summary$Mean_Change_Pct[4] - apr_sensitivity_summary$Mean_Change_Pct[3]) / 10,
+    (apr_sensitivity_summary$Mean_Change_Pct[5] - apr_sensitivity_summary$Mean_Change_Pct[4]) / 10
+  )
+)
+
+# Mean marginal effect (~1.1% per 1% APR change as stated in PDF)
+mean_marginal_apr <- mean(apr_marginal_sensitivity$Marginal_Effect, na.rm = TRUE)
+
+# ============================================================================
+# Erosivity sensitivity analysis (±20% scenarios)
+# ============================================================================
+
+erosivity_scenarios <- c(0.8, 0.9, 1.0, 1.1, 1.2)
+erosivity_sensitivity_results <- list()
+
+for (ero_factor in erosivity_scenarios) {
+  
+  # Modify erosivity while keeping other predictors constant
+  scenario_data <- pred_check %>%
+    mutate(
+      erosivity_mean_sim = pmax(baseline_erosivity * ero_factor, 0.1),
+      
+      # Recalculate derived features
+      log_erosivity = log10(erosivity_mean_sim + 0.001),
+      log_apr = log10(baseline_apr + 0.001),
+      log_rnf = log10(baseline_rnf + 0.001),
+      
+      # Update interaction term
+      erosivity_apr_interaction = erosivity_mean_sim * baseline_apr,
+      
+      # Keep other features unchanged
+      apr_lag1 = apr_lag1,
+      erosivity_lag1 = erosivity_lag1,
+      year_scaled = 0
+    )
+  
+  # Build feature matrix for this scenario
+  X_scenario <- matrix(
+    NA_real_,
+    nrow = nrow(scenario_data),
+    ncol = length(final_features),
+    dimnames = list(NULL, final_features)
+  )
+  
+  for (f in final_features) {
+    X_scenario[, f] <- as.numeric(scenario_data[[f]])
+  }
+  
+  # Predict
+  scenario_predictions <- predict(xgb_final, xgb.DMatrix(X_scenario))
+  
+  # Calculate changes in percent space
+  changes <- data.frame(
+    predicted_log = scenario_predictions,
+    baseline_log = baseline_predictions
+  ) %>%
+    filter(baseline_log >= -2) %>%
+    mutate(
+      change_pct = ((10^predicted_log) - (10^baseline_log)) / (10^baseline_log) * 100
+    )
+  
+  # Store results
+  erosivity_sensitivity_results[[as.character(ero_factor)]] <- data.frame(
+    Scenario = paste0("Erosivity ", ero_factor, "x"),
+    Erosivity_Factor = ero_factor,
+    Mean_Change_Pct = mean(changes$change_pct, na.rm = TRUE),
+    Median_Change_Pct = median(changes$change_pct, na.rm = TRUE),
+    SD_Change_Pct = sd(changes$change_pct, na.rm = TRUE),
+    Sites_Increase = sum(changes$change_pct > 0, na.rm = TRUE),
+    Sites_Decrease = sum(changes$change_pct < 0, na.rm = TRUE),
+    Pct_Increase = mean(changes$change_pct > 0, na.rm = TRUE) * 100,
+    Q25_Change = quantile(changes$change_pct, 0.25, na.rm = TRUE),
+    Q75_Change = quantile(changes$change_pct, 0.75, na.rm = TRUE)
+  )
+}
+
+erosivity_sensitivity_summary <- do.call(rbind, erosivity_sensitivity_results)
+
+# Calculate marginal sensitivity (% discharge change per 1% erosivity change)
+erosivity_marginal_sensitivity <- data.frame(
+  Erosivity_Change = c(-20, -10, 0, 10, 20),
+  Mean_Discharge_Change = erosivity_sensitivity_summary$Mean_Change_Pct,
+  Marginal_Effect = c(
+    NA,
+    (erosivity_sensitivity_summary$Mean_Change_Pct[2] - erosivity_sensitivity_summary$Mean_Change_Pct[1]) / 10,
+    (erosivity_sensitivity_summary$Mean_Change_Pct[3] - erosivity_sensitivity_summary$Mean_Change_Pct[2]) / 10,
+    (erosivity_sensitivity_summary$Mean_Change_Pct[4] - erosivity_sensitivity_summary$Mean_Change_Pct[3]) / 10,
+    (erosivity_sensitivity_summary$Mean_Change_Pct[5] - erosivity_sensitivity_summary$Mean_Change_Pct[4]) / 10
+  )
+)
+
+# Mean marginal effect (~0.3% per 1% erosivity change as stated in PDF)
+mean_marginal_erosivity <- mean(erosivity_marginal_sensitivity$Marginal_Effect, na.rm = TRUE)
+
+# Combined sensitivity comparison
+sensitivity_comparison <- data.frame(
+  Driver = c("Application Rate (APR)", "Erosivity"),
+  Mean_Marginal_Effect = c(mean_marginal_apr, mean_marginal_erosivity),
+  Interpretation = c(
+    paste0("~", round(mean_marginal_apr, 2), "% discharge change per 1% APR change"),
+    paste0("~", round(mean_marginal_erosivity, 2), "% discharge change per 1% erosivity change")
   )
 )
